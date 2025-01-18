@@ -1,0 +1,9 @@
+setuptools
+scikit-learn
+numpy
+streamlit
+requests
+flask
+redis
+googlemaps
+python-dotenv
