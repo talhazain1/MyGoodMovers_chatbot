@@ -1,55 +1,116 @@
+# app.py
+
 import os
 import uuid
 import re
 import json
 from datetime import datetime
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from dateutil import parser
+import logging
 
-# Managers
-from redis_manager import RedisManager
+# Managers (Ensure these are correctly implemented in separate modules)
 from openai_manager import OpenAIManager
 from maps_manager import MapsManager
 from faq_manager import FAQManager
 
 ##############################################
-# FLASK APP SETUP + CORS + SQLITE CONFIG
+# FLASK APP SETUP + CORS + SQLALCHEMY CONFIG
 ##############################################
 app = Flask(__name__)
+# Allow all origins for development
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Configuration
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(os.getcwd(), "chatbot.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
 ##############################################
-# DATABASE MODEL: ChatRecord for storing ended chats
+# DATABASE MODELS
 ##############################################
-class ChatRecord(db.Model):
+
+class ChatState:
+    INITIAL = "INITIAL"
+    COST_ESTIMATED = "COST_ESTIMATED"
+    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+    AWAITING_DETAILS = "AWAITING_DETAILS"
+    AWAITING_FINAL_CONFIRMATION = "AWAITING_FINAL_CONFIRMATION"
+    MODIFY_DETAILS = "MODIFY_DETAILS"  # New State
+    CONFIRMED = "CONFIRMED"
+
+class ChatSession(db.Model):
     """
-    Stores completed chatbot sessions. Each record corresponds to
-    one 'ended' chat, containing:
-      - chat_id (matches Redis)
-      - username
-      - contact_no
-      - messages (the entire transcript)
-      - created_at (timestamp)
+    Represents a chat session.
     """
-    __tablename__ = "chat_records"
+    __tablename__ = "chat_sessions"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    chat_id = db.Column(db.String(100), nullable=False)
-    username = db.Column(db.String(100), default="Unknown")
-    contact_no = db.Column(db.String(50), default="Unknown")
-    messages = db.Column(db.Text)  # entire conversation transcript
+    chat_id = db.Column(db.String(100), unique=True, nullable=False)
+    username = db.Column(db.String(100), nullable=True)  # Changed to nullable
+    contact_no = db.Column(db.String(50), nullable=True)  # Changed to nullable
+    move_date = db.Column(db.String(100), nullable=True)
+    estimated_cost_min = db.Column(db.Float, nullable=True)
+    estimated_cost_max = db.Column(db.Float, nullable=True)
+    confirmed = db.Column(db.Boolean, default=False)
+    is_active = db.Column(db.Boolean, default=True)  # New Column
+    state = db.Column(db.String(50), default=ChatState.INITIAL)  # New Field
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    messages = db.relationship("Message", backref="chat_session", lazy=True)
+    move_detail = db.relationship(
+        "MoveDetail",
+        backref="chat_session",
+        uselist=False
+    )
+
+    def __repr__(self):
+        return f"<ChatSession {self.chat_id}>"
+
+class Message(db.Model):
+    """
+    Represents an individual message within a chat session.
+    """
+    __tablename__ = "messages"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    chat_id = db.Column(
+        db.String(100),
+        db.ForeignKey("chat_sessions.chat_id"),
+        nullable=False
+    )
+    sender = db.Column(db.String(20), nullable=False)  # 'user' or 'assistant'
+    message = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Message {self.id} from {self.sender}>"
+
+class MoveDetail(db.Model):
+    """
+    Represents move details extracted from user inputs.
+    """
+    __tablename__ = "move_details"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    chat_id = db.Column(
+        db.String(100),
+        db.ForeignKey("chat_sessions.chat_id"),
+        unique=True,
+        nullable=False
+    )
+    origin = db.Column(db.String(100), nullable=True)
+    destination = db.Column(db.String(100), nullable=True)
+    move_size = db.Column(db.String(100), nullable=True)
+    additional_services = db.Column(db.String(200), nullable=True)
+    # Removed move_date from here
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def __repr__(self):
-        return f"<ChatRecord {self.chat_id}>"
-
+        return f"<MoveDetail {self.chat_id}>"
 
 with app.app_context():
     db.create_all()
@@ -57,7 +118,6 @@ with app.app_context():
 ##############################################
 # INIT MANAGERS
 ##############################################
-redis_manager = RedisManager()
 openai_manager = OpenAIManager()
 maps_manager = MapsManager()
 faq_manager = FAQManager()
@@ -65,36 +125,68 @@ faq_manager = FAQManager()
 faq_manager.load_faqs("/Users/TalhaZain/chatbot_html/backend/data/faqs.jsonl")
 
 ##############################################
-# HELPER: system prompt for short GPT replies
+# LOGGER CONFIGURATION
 ##############################################
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+##############################################
+# HELPER FUNCTIONS
+##############################################
+def is_move_request(user_text):
+    """
+    Determines if the user's message is likely a move request by checking for key phrases and patterns.
+    """
+    move_keywords = [
+        "move from",
+        "moving from",
+        "relocate from",
+        "relocating from",
+        "shift from",
+        "shifting from",
+        "transport from",
+        "transporting from"
+    ]
+    
+    # Check if any of the move keywords are in the text
+    has_move_keyword = any(keyword in user_text.lower() for keyword in move_keywords)
+    
+    # Basic check for location patterns (e.g., "from X to Y")
+    has_location_pattern = bool(re.search(r'from\s+\w+\s+to\s+\w+', user_text.lower()))
+    
+    return has_move_keyword or has_location_pattern
+
 def create_short_system_prompt():
     """
-    Return a system prompt instructing the model to be concise.
+    Return a system prompt instructing the model to be concise and use emoticons.
     """
     return (
-        "You are a helpful assistant for My Good Movers. "
+        "You are MoveBot 🤖, a friendly assistant for My Good Movers. "
         "My Good Movers is a platform that connects users and moving companies. "
         "Try to convince the user to take our services. "
+        "Use emoticons to make your responses more friendly and engaging. "
         "Keep your answers brief, no more than 2 short sentences."
     )
 
-##############################################
-# HELPER: Decide if user query is an FAQ
-##############################################
 def is_faq_query(user_text):
     """
     Determines if the user query is likely an FAQ based on keywords.
     """
-    # You can enhance this with more sophisticated NLP techniques or use semantic similarity
-    keywords = ["modify booking", "hidden charge", "refund", "cancel", "policy", "charges", "payment", "change booking"]
+    keywords = [
+        "modify booking",
+        "hidden charge",
+        "refund",
+        "cancel",
+        "policy",
+        "charges",
+        "payment",
+        "change booking"
+    ]
     for kw in keywords:
         if kw in user_text.lower():
             return True
     return False
 
-##############################################
-# HELPER: Let OpenAI parse the user's text for move fields
-##############################################
 def standardize_date(date_str):
     """
     Converts a date string into a standard YYYY-MM-DD format.
@@ -103,32 +195,12 @@ def standardize_date(date_str):
         parsed_date = parser.parse(date_str, fuzzy=True)
         return parsed_date.strftime("%Y-%m-%d")
     except Exception as e:
-        print(f"[ERROR] Date Parsing Error: {e}")
-        return date_str  # Return as-is if parsing fails
-
-def is_valid_contact(contact_no):
-    """
-    Validates the contact number using regex.
-    Accepts formats like '555-1234', '5551234', '+1-555-1234', etc.
-    """
-    pattern = r'^(\+\d{1,2}\s?)?(\d{3}[-.\s]?){2}\d{4}$'
-    return re.match(pattern, contact_no) is not None
-
-# def parse_move_date_fallback(user_text):
-#     """
-#     Attempts to parse a date from the user input using dateutil.
-#     Returns a standardized date string or None if parsing fails.
-#     """
-#     try:
-#         parsed_date = parser.parse(user_text, fuzzy=True)
-#         return parsed_date.strftime("%Y-%m-%d")
-#     except Exception as e:
-#         print(f"[ERROR] Date Parsing Fallback Error: {e}")
-#         return None
+        logger.error(f"Date Parsing Error: {e}")
+        return None  # Return None if parsing fails
 
 def parse_move_details_with_openai(user_text):
     """
-    Enhanced parsing function with fallback for move_date.
+    Enhanced parsing function with validation for move_date.
     """
     system_prompt = (
         "You are a JSON parser for a moving service chatbot. The user may provide details about their move.\n"
@@ -189,30 +261,34 @@ def parse_move_details_with_openai(user_text):
     )
 
     # Call the extraction method from OpenAIManager
-    extraction_response = openai_manager.extract_fields_from_text(system_prompt, user_text)
-    print(f"[DEBUG] OpenAI Extraction Response: {extraction_response}")  # Debugging
+    extraction_response = openai_manager.extract_fields_from_text(
+        system_prompt, user_text
+    )
+    logger.debug(f"OpenAI Extraction Response: {extraction_response}")  # Debugging
 
     try:
         parsed_data = json.loads(extraction_response)
-        print(f"[DEBUG] Parsed Data: {parsed_data}")  # Debugging
+        logger.debug(f"Parsed Data: {parsed_data}")  # Debugging
 
         move_date = parsed_data.get("move_date")
-        if not move_date:
-            # Attempt to parse move_date using fallback
-            move_date = standardize_date(user_text)
-            parsed_data["move_date"] = move_date
+        if move_date:
+            standardized_date = standardize_date(move_date)
+            if standardized_date:
+                parsed_data["move_date"] = standardized_date
+            else:
+                parsed_data["move_date"] = None  # Invalid date, set to None
 
         return {
             "origin": parsed_data.get("origin"),
             "destination": parsed_data.get("destination"),
             "move_size": parsed_data.get("move_size"),
-            "move_date": parsed_data.get("move_date"),  # Added move_date
+            "move_date": parsed_data.get("move_date"),  # May be None
             "additional_services": parsed_data.get("additional_services") or [],
-            "username": parsed_data.get("username"),
-            "contact_no": parsed_data.get("contact_no")
+            # "username": parsed_data.get("username"),
+            # "contact_no": parsed_data.get("contact_no")
         }
     except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON Decode Error: {e}")
+        logger.error(f"JSON Decode Error: {e}")
         # Fallback if parse fails
         return {
             "origin": None,
@@ -220,262 +296,469 @@ def parse_move_details_with_openai(user_text):
             "move_size": None,
             "move_date": None,  # Ensure move_date is present
             "additional_services": [],
-            "username": None,
-            "contact_no": None
+            # "username": None,
+            # "contact_no": None
         }
-##############################################
-# HELPER: normal GPT fallback
-##############################################
-def normal_gpt_reply(chat_id, user_text):
+
+def normal_gpt_reply(chat_session, user_text):
     """
-    If we decide it's neither cost nor FAQ, do a normal GPT approach.
+    If it's neither cost nor FAQ, do a normal GPT approach.
     """
-    prev_context = redis_manager.get_context(chat_id, "context") or ""
     system_prompt = create_short_system_prompt()
-    combined_input = f"{prev_context}\nUser: {user_text}"
+    combined_input = f"Chat History:\n{get_chat_history(chat_session.chat_id)}\nUser: {user_text}"
 
     gpt_response = openai_manager.get_general_response(
         system_content=system_prompt,
         user_content=combined_input
     )
-    updated_context = f"{combined_input}\nAssistant: {gpt_response}"
-    redis_manager.update_context(chat_id, "context", updated_context)
 
-    # Append to chat
-    redis_manager.add_message(chat_id, user_text, gpt_response)
+    # Store the assistant's reply
+    assistant_message = Message(
+        chat_id=chat_session.chat_id,
+        sender="assistant",
+        message=gpt_response
+    )
+    db.session.add(assistant_message)
+    db.session.commit()
+
     return gpt_response
+
+def get_chat_history(chat_id):
+    """
+    Retrieves the entire chat history for a given chat_id.
+    """
+    messages = Message.query.filter_by(
+        chat_id=chat_id).order_by(
+        Message.timestamp).all()
+    history = "\n".join([f"{msg.sender.capitalize()}: {msg.message}" for msg in messages])
+    return history
 
 ##############################################
 # FLASK ROUTES
 ##############################################
-@app.route("/home", methods=["GET"])
+
+@app.route("/", methods=["GET"])
 def home():
-    return "Chatbot API is running."
+    return render_template('index.html')
 
 @app.route("/start_chat", methods=["POST"])
-def start_chat():
-    chat_id = str(uuid.uuid4())
-    data = request.json or {}
-    username = data.get("username", "Unknown")
-    contact_no = data.get("contact_no", "Unknown")
+def start_chat_route():
+    try:
+        # Generate a unique chat_id
+        chat_id = str(uuid.uuid4())
+        logger.info(f"Starting new chat session with chat_id: {chat_id}")
 
-    redis_manager.init_chat(chat_id, username=username, contact_no=contact_no)
-    return jsonify({"chat_id": chat_id, "message": "New chat started."})
+        # Create a new ChatSession with INITIAL state
+        chat_session = ChatSession(
+            chat_id=chat_id,
+            state=ChatState.INITIAL
+        )
+        db.session.add(chat_session)
+        db.session.commit()
+
+        # Create a welcome message
+        welcome_message = "Hello! I'm MoveBot 🤖. How can I assist you with your move today? 📦🚚"
+        welcome = Message(
+            chat_id=chat_id,
+            sender="assistant",
+            message=welcome_message
+        )
+        db.session.add(welcome)
+        db.session.commit()
+
+        logger.info(f"Chat session {chat_id} initialized successfully.")
+
+        return jsonify({
+            "chat_id": chat_id,
+            "message": welcome_message
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error in /start_chat: {e}")
+        return jsonify({"error": "Failed to start chat session."}), 500
 
 @app.route("/end_chat", methods=["POST"])
 def end_chat():
     """
     Ends chat, store final in DB.
     """
-    data = request.json or {}
-    chat_id = data.get("chat_id")
-    if not chat_id:
-        return jsonify({"error": "Missing chat_id"}), 400
-
     try:
-        # Get entire chat history from Redis
-        chat_history = redis_manager.get_chat_history(chat_id)
-        # Get move details
-        move_details = redis_manager.get_move_details(chat_id)
+        data = request.get_json() or {}
+        chat_id = data.get("chat_id")
+        if not chat_id:
+            return jsonify({"error": "Missing chat_id"}), 400
 
-        # Combine messages
-        transcript = "\n".join(chat_history["messages"])
-        username = move_details.get("username", "Unknown")
-        contact_no = move_details.get("contact_no", "Unknown")
+        # Retrieve ChatSession
+        chat_session = ChatSession.query.filter_by(chat_id=chat_id).first()
+        if not chat_session:
+            return jsonify({"error": "Chat session not found."}), 404
 
-        # Store in SQLite
-        record = ChatRecord(
+        # Store the bot's farewell message
+        farewell_message = "Chat ended successfully. Thank you for using My Good Movers! 👋"
+        farewell = Message(
             chat_id=chat_id,
-            username=username,
-            contact_no=contact_no,
-            messages=transcript
+            sender="assistant",
+            message=farewell_message
         )
-        db.session.add(record)
+        db.session.add(farewell)
+
+        # Deactivate the chat session
+        chat_session.is_active = False
+        db.session.add(chat_session)
         db.session.commit()
 
-        # Mark chat finished
-        redis_manager.finish_chat(chat_id)
-        return jsonify({"message": f"Chat {chat_id} ended and stored in DB successfully."})
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        logger.info(f"Chat session {chat_id} ended by user.")
+
+        return jsonify({"message": farewell_message}), 200
+
+    except Exception as e:
+        logger.error(f"Error in /end_chat: {e}")
+        return jsonify(
+            {"error": "An error occurred while ending the chat."}), 500
 
 @app.route("/general_query", methods=["POST"])
-def general_query():
-    data = request.json or {}
-    user_input = data.get("message", "").strip()
-    chat_id = data.get("chat_id") or str(uuid.uuid4())
+def general_query_route():
+    try:
+        data = request.get_json() or {}
+        user_input = data.get("message", "").strip()
+        chat_id = data.get("chat_id")
 
-    # 1) Initialize or retrieve session
-    redis_manager.init_chat(chat_id)
+        if not chat_id:
+            return jsonify({"error": "Missing chat_id"}), 400
 
-    # 2) Store user message with placeholder
-    redis_manager.add_message(
-        chat_id,
-        user_message=user_input,
-        assistant_message="[Processing]",
-        overwrite_last=True
-    )
+        # Retrieve ChatSession
+        chat_session = ChatSession.query.filter_by(chat_id=chat_id).first()
+        if not chat_session:
+            return jsonify({"error": "Chat session not found."}), 404
 
-    # 3) Check if user might be asking an FAQ
-    if is_faq_query(user_input):
-        # Call FAQ manager
-        answer = faq_manager.find_best_match(user_input)
-        redis_manager.add_message(
-            chat_id,
-            user_message=user_input,
-            assistant_message=answer,
-            overwrite_last=True
+        if not chat_session.is_active and chat_session.state != ChatState.CONFIRMED:
+            return jsonify({"error": "This chat session has been ended. Please start a new session."}), 400
+
+        # Store user message
+        user_message = Message(
+            chat_id=chat_id,
+            sender="user",
+            message=user_input
         )
-        return jsonify({"reply": answer, "chat_id": chat_id})
+        db.session.add(user_message)
+        db.session.commit()
 
-    # 4) Parse info with OpenAI
-    extracted = parse_move_details_with_openai(user_input)
-    print(f"[DEBUG] Extracted Data: {extracted}")  # Debugging
+        logger.info(f"Received message from user in chat_id {chat_id}: {user_input}")
 
-    # Merge with existing data in Redis
-    # Update origin
-    old_origin = redis_manager.get_context(chat_id, "origin")
-    if extracted.get("origin") and not old_origin:
-        redis_manager.update_context(chat_id, "origin", extracted["origin"].lower())
+        # Handle based on current state
+        current_state = chat_session.state
 
-    # Update destination
-    old_dest = redis_manager.get_context(chat_id, "destination")
-    if extracted.get("destination") and not old_dest:
-        redis_manager.update_context(chat_id, "destination", extracted["destination"].lower())
+        # INITIAL state handling
+        if current_state == ChatState.INITIAL:
+            # First check if it's a FAQ query
+            if is_faq_query(user_input):
+                answer = faq_manager.find_best_match(user_input)
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=answer
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+                return jsonify({"reply": answer, "chat_id": chat_id}), 200
+            
+            # Then check if it's a move request
+            if is_move_request(user_input):
+                # Parse move details
+                extracted = parse_move_details_with_openai(user_input)
+                
+                # Update MoveDetail
+                move_detail = chat_session.move_detail
+                if not move_detail:
+                    move_detail = MoveDetail(chat_id=chat_id)
+                move_detail.origin = extracted.get("origin") or move_detail.origin
+                move_detail.destination = extracted.get("destination") or move_detail.destination
+                move_detail.move_size = extracted.get("move_size") or move_detail.move_size
+                move_detail.additional_services = ",".join(extracted.get("additional_services")) if extracted.get("additional_services") else move_detail.additional_services
+                
+                if extracted.get("move_date"):
+                    chat_session.move_date = extracted.get("move_date")
+                
+                db.session.add(move_detail)
+                db.session.commit()
 
-    # Update move_size
-    old_size = redis_manager.get_context(chat_id, "move_size")
-    if extracted.get("move_size") and not old_size:
-        redis_manager.update_context(chat_id, "move_size", extracted["move_size"])
+                # Check if we have enough info for cost estimate
+                if move_detail.origin and move_detail.destination and move_detail.move_size and chat_session.move_date:
+                    # Calculate cost
+                    distance, cost_range = maps_manager.estimate_cost(
+                        move_detail.origin,
+                        move_detail.destination,
+                        move_detail.move_size,
+                        move_detail.additional_services.split(',') if move_detail.additional_services else []
+                    )
+                    
+                    if distance is not None:
+                        min_cost, max_cost = cost_range
+                        chat_session.estimated_cost_min = min_cost
+                        chat_session.estimated_cost_max = max_cost
+                        chat_session.state = ChatState.COST_ESTIMATED
+                        db.session.commit()
 
-    # Update move_date
-    old_move_date = redis_manager.get_context(chat_id, "move_date")
-    if extracted.get("move_date") and not old_move_date:
-        standardized_date = standardize_date(extracted["move_date"])
-        redis_manager.update_context(chat_id, "move_date", standardized_date)
+                        estimate_reply = (
+                            f"The estimated cost for moving from {move_detail.origin.title()} to {move_detail.destination.title()} "
+                            f"({move_detail.move_size.title()}, date: {chat_session.move_date}) is between ${min_cost} and ${max_cost}. 🏠📦💰\n\n"
+                            f"Would you like to proceed with booking this move? (Reply with Yes/No) 👍👎"
+                        )
 
-    # Update additional_services
-    old_services = redis_manager.get_context(chat_id, "additional_services") or ""
-    existing_svc = set(s.strip() for s in old_services.split(",")) if old_services else set()
-    for svc in extracted.get("additional_services", []):
-        if svc:  # Ensure no empty strings
-            existing_svc.add(svc)
-    new_svc_str = ",".join(s for s in existing_svc if s)
-    redis_manager.update_context(chat_id, "additional_services", new_svc_str)
+                        assistant_message = Message(
+                            chat_id=chat_id,
+                            sender="assistant",
+                            message=estimate_reply
+                        )
+                        db.session.add(assistant_message)
+                        db.session.commit()
 
-    # Update username
-    if extracted.get("username"):
-        redis_manager.update_context(chat_id, "username", extracted["username"])
+                        return jsonify({"reply": estimate_reply, "chat_id": chat_id}), 200
+                
+                # If we don't have enough info, ask for missing details
+                missing_fields = []
+                if not move_detail.origin:
+                    missing_fields.append("origin location")
+                if not move_detail.destination:
+                    missing_fields.append("destination")
+                if not move_detail.move_size:
+                    missing_fields.append("move size")
+                if not chat_session.move_date:
+                    missing_fields.append("move date")
 
-    # Update contact_no with validation
-    if extracted.get("contact_no"):
-        redis_manager.update_context(chat_id, "contact_no", extracted["contact_no"])
-        # return jsonify({"reply": reply, "chat_id": chat_id})
+                if missing_fields:
+                    missing_fields_str = ", ".join(missing_fields[:-1]) + (" and " if len(missing_fields) > 1 else "") + missing_fields[-1]
+                    reply = f"To provide you with an accurate cost estimate, I need your {missing_fields_str}. Please provide these details. 📝"
+                    
+                    assistant_message = Message(
+                        chat_id=chat_id,
+                        sender="assistant",
+                        message=reply
+                    )
+                    db.session.add(assistant_message)
+                    db.session.commit()
 
-    # 5) If user is asking cost
-    lower_in = user_input.lower()
-    if any(kw in lower_in for kw in ["cost", "estimate", "quote", "how much", "price"]):
-        # Retrieve final data
-        origin = redis_manager.get_context(chat_id, "origin")
-        destination = redis_manager.get_context(chat_id, "destination")
-        move_size = redis_manager.get_context(chat_id, "move_size")
-        move_date = redis_manager.get_context(chat_id, "move_date")
-        add_svc_str = redis_manager.get_context(chat_id, "additional_services") or ""
-        additional_services = [s for s in add_svc_str.split(",") if s]
+                    return jsonify({"reply": reply, "chat_id": chat_id}), 200
+            
+            # If it's not a move request or FAQ, handle as general query
+            return jsonify({"reply": normal_gpt_reply(chat_session, user_input), "chat_id": chat_id}), 200
 
-        username = redis_manager.get_context(chat_id, "username")
-        contact_no = redis_manager.get_context(chat_id, "contact_no")
-
-        # Identify which fields are missing
-        missing_fields = []
-        if not origin:
-            missing_fields.append("origin")
-        if not destination:
-            missing_fields.append("destination")
-        if not move_size:
-            missing_fields.append("move size")
-        if not move_date:
-            missing_fields.append("move date")
-        # if not username or username == "Unknown":
-        #     missing_fields.append("name")
-        # if not contact_no or contact_no == "Unknown":
-        #     missing_fields.append("contact number")
-
-        if missing_fields:
-            # Build a user-friendly reply based on how many fields are missing
-            if len(missing_fields) == 1:
-                reply = f"We still need your {missing_fields[0]}. Please provide it."
-            elif len(missing_fields) == 2:
-                reply = f"We still need your {missing_fields[0]} and {missing_fields[1]}. Please provide them."
+        # Handle state after cost estimate is provided
+        elif current_state == ChatState.COST_ESTIMATED:
+            if user_input.lower() in ["yes", "y", "👍"]:
+                chat_session.state = ChatState.AWAITING_DETAILS
+                db.session.commit()
+                
+                reply = "Great! To confirm your booking, I'll need your name and contact number. Please provide them in this format: John Doe, 555-1234 📇"
+                
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=reply
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+                
+                return jsonify({"reply": reply, "chat_id": chat_id}), 200
+            
+            elif user_input.lower() in ["no", "n", "👎"]:
+                chat_session.state = ChatState.INITIAL
+                reply = "No problem! Let me know if you'd like to get another estimate or if you have any questions. 😊"
+                
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=reply
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+                
+                return jsonify({"reply": reply, "chat_id": chat_id}), 200
+            
             else:
-                # More than two missing
-                joined_fields = ", ".join(missing_fields[:-1]) + f", and {missing_fields[-1]}"
-                reply = f"We still need your {joined_fields}. Please provide them."
+                reply = "Please respond with 'Yes' or 'No'. Would you like to proceed with booking this move? 👍👎"
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=reply
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+                return jsonify({"reply": reply, "chat_id": chat_id}), 200
 
-            redis_manager.add_message(
-                chat_id,
-                user_message=user_input,
-                assistant_message=reply,
-                overwrite_last=True
+        # Handle user details collection
+        elif current_state == ChatState.AWAITING_DETAILS:
+            name_contact = user_input.split(",")
+            if len(name_contact) < 2:
+                prompt = "Please provide both your name and contact number, separated by a comma. For example: John Doe, 555-1234 📇"
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=prompt
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+                return jsonify({"reply": prompt, "chat_id": chat_id}), 200
+
+            name = name_contact[0].strip()
+            contact_no = name_contact[1].strip()
+
+            # Update ChatSession with user details
+            chat_session.username = name
+            chat_session.contact_no = contact_no
+            chat_session.state = ChatState.AWAITING_FINAL_CONFIRMATION
+            db.session.commit()
+
+            # Display all details for final confirmation
+            move_detail = chat_session.move_detail
+            if not move_detail:
+                return jsonify({"error": "Move details not found."}), 400
+
+            details = (
+                f"Here are your move details:\n"
+                f"📍 <strong>From:</strong> {move_detail.origin.title() if move_detail.origin else 'Not Provided'}\n"
+                f"📍 <strong>To:</strong> {move_detail.destination.title() if move_detail.destination else 'Not Provided'}\n"
+                f"🏠 <strong>Move Size:</strong> {move_detail.move_size.title() if move_detail.move_size else 'Not Provided'}\n"
+                f"📅 <strong>Move Date:</strong> {chat_session.move_date}\n"
+                f"💰 <strong>Estimated Cost:</strong> ${chat_session.estimated_cost_min} - ${chat_session.estimated_cost_max}\n"
+                f"👤 <strong>Name:</strong> {chat_session.username}\n"
+                f"📞 <strong>Contact No:</strong> {chat_session.contact_no}\n\n"
+                f"Please review your details. Do you confirm this booking? (Yes/No) 👍👎"
             )
-            return jsonify({"reply": reply, "chat_id": chat_id})
 
-        # All required fields are present, proceed to calculate cost
-        distance, cost_range = maps_manager.estimate_cost(
-            origin,
-            destination,
-            move_size,
-            additional_services
-        )
-        if distance is None:
-            reply = f"Sorry, I couldn’t calculate the distance from {origin.title()} to {destination.title()}."
+            assistant_message = Message(
+                chat_id=chat_id,
+                sender="assistant",
+                message=details
+            )
+            db.session.add(assistant_message)
+            db.session.commit()
+
+            return jsonify({"reply": details, "chat_id": chat_id}), 200
+
+        # Handle final confirmation
+        elif current_state == ChatState.AWAITING_FINAL_CONFIRMATION:
+            if user_input.lower() in ["yes", "y", "👍"]:
+                chat_session.confirmed = True
+                chat_session.state = ChatState.CONFIRMED
+                chat_session.is_active = False
+                db.session.commit()
+
+                confirmation_message = "Your move has been successfully confirmed! 🎉 Our team will reach out to you shortly. Thank you for choosing My Good Movers! 😊"
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=confirmation_message
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+
+                return jsonify({"reply": confirmation_message, "chat_id": chat_id}), 200
+
+            elif user_input.lower() in ["no", "n", "👎"]:
+                chat_session.state = ChatState.MODIFY_DETAILS
+                reply = "I understand. What details would you like to modify? Please provide the updated information."
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=reply
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+
+                return jsonify({"reply": reply, "chat_id": chat_id}), 200
+
+            else:
+                reply = "Please respond with 'Yes' or 'No'. Do you confirm this booking? 👍👎"
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=reply
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+                return jsonify({"reply": reply, "chat_id": chat_id}), 200
+
+        # Handle modifications
+        elif current_state == ChatState.MODIFY_DETAILS:
+            # Parse the modification request
+            extracted = parse_move_details_with_openai(user_input)
+            move_detail = chat_session.move_detail
+            
+            if extracted.get("origin"):
+                move_detail.origin = extracted["origin"]
+            if extracted.get("destination"):
+                move_detail.destination = extracted["destination"]
+            if extracted.get("move_size"):
+                move_detail.move_size = extracted["move_size"]
+            if extracted.get("move_date"):
+                chat_session.move_date = extracted["move_date"]
+            if extracted.get("additional_services"):
+                move_detail.additional_services = ",".join(extracted["additional_services"])
+                
+            # Recalculate cost if necessary
+            if any([extracted.get(field) for field in ["origin", "destination", "move_size"]]):
+                distance, cost_range = maps_manager.estimate_cost(
+                    move_detail.origin,
+                    move_detail.destination,
+                    move_detail.move_size,
+                    move_detail.additional_services.split(',') if move_detail.additional_services else []
+                )
+                if distance is not None:
+                    chat_session.estimated_cost_min, chat_session.estimated_cost_max = cost_range
+
+            db.session.commit()
+            
+            # Show updated details
+            details = (
+                f"Here are your updated move details:\n"
+                f"📍 <strong>From:</strong> {move_detail.origin.title() if move_detail.origin else 'Not Provided'}\n"
+                f"📍 <strong>To:</strong> {move_detail.destination.title() if move_detail.destination else 'Not Provided'}\n"
+                f"🏠 <strong>Move Size:</strong> {move_detail.move_size.title() if move_detail.move_size else 'Not Provided'}\n"
+                f"📅 <strong>Move Date:</strong> {chat_session.move_date}\n"
+                f"💰 <strong>Estimated Cost:</strong> ${chat_session.estimated_cost_min} - ${chat_session.estimated_cost_max}\n"
+                f"👤 <strong>Name:</strong> {chat_session.username}\n"
+                f"📞 <strong>Contact No:</strong> {chat_session.contact_no}\n\n"
+                f"Please review your updated details. Do you confirm this booking? (Yes/No) 👍👎"
+            )
+            
+            chat_session.state = ChatState.AWAITING_FINAL_CONFIRMATION
+            db.session.commit()
+            
+            assistant_message = Message(
+                chat_id=chat_id,
+                sender="assistant",
+                message=details
+            )
+            db.session.add(assistant_message)
+            db.session.commit()
+            
+            return jsonify({"reply": details, "chat_id": chat_id}), 200
+
+        # Handle FAQ or general queries in any other state
         else:
-            min_cost, max_cost = cost_range
-            reply = (
-                f"The estimated cost for moving from {origin.title()} to {destination.title()} "
-                f"({move_size.title()} is between ${min_cost} and ${max_cost}."
-            )
+            if is_faq_query(user_input):
+                answer = faq_manager.find_best_match(user_input)
+                assistant_message = Message(
+                    chat_id=chat_id,
+                    sender="assistant",
+                    message=answer
+                )
+                db.session.add(assistant_message)
+                db.session.commit()
+                return jsonify({"reply": answer, "chat_id": chat_id}), 200
 
-        # Store the cost reply
-        redis_manager.add_message(
-            chat_id,
-            user_message=user_input,
-            assistant_message=reply,
-            overwrite_last=True
-        )
+            return jsonify({"reply": normal_gpt_reply(chat_session, user_input), "chat_id": chat_id}), 200
 
-        # Prompt for name and contact if missing
-        prompts = []
-        if not username or username == "Unknown":
-            prompts.append("Please provide your name.")
-        if not contact_no or contact_no == "Unknown":
-            if username and username != "Unknown":
-                prompts.append(f"Thanks {username}, now please share your contact number.")
-            else:
-                prompts.append("Please provide your contact number.")
-
-        if prompts:
-            full_reply = reply + " " + " ".join(prompts)
-            redis_manager.add_message(
-                chat_id,
-                user_message=user_input,
-                assistant_message=full_reply,
-                overwrite_last=True
-            )
-            return jsonify({"reply": full_reply, "chat_id": chat_id})
-
-        return jsonify({"reply": reply, "chat_id": chat_id})
-    else:
-        # 6) Fallback normal GPT
-        final_reply = normal_gpt_reply(chat_id, user_input)
-        return jsonify({"reply": final_reply, "chat_id": chat_id})
-
+    except Exception as e:
+        logger.error(f"Error in /general_query:")
 ##############################################
 # (Optional) Other endpoints
 ##############################################
+
 @app.route("/calculate_distance", methods=["POST"])
 def calculate_distance():
-    data = request.json or {}
+    data = request.get_json() or {}
     origin = data.get("origin")
     destination = data.get("destination")
 
@@ -485,18 +768,20 @@ def calculate_distance():
     try:
         distance = maps_manager.calculate_distance(origin, destination)
         if distance is None:
-            return jsonify({"error": "Unable to calculate distance. Check locations."}), 400
+            return jsonify(
+                {"error": "Unable to calculate distance."}), 400
         return jsonify({"distance": distance})
     except Exception as e:
+        logger.error(f"Error calculating distance: {e}")
         return jsonify({"error": f"An error occurred: {e}"}), 500
 
 @app.route("/estimate_cost", methods=["POST"])
 def estimate_cost():
     """
-    Direct approach if you want a separate route to pass origin/dest/size. 
+    Direct approach if you want a separate route to pass origin/dest/size.
     But we mainly handle cost in general_query above.
     """
-    data = request.json or {}
+    data = request.get_json() or {}
     chat_id = data.get("chat_id") or str(uuid.uuid4())
 
     origin = data.get("origin")
@@ -508,30 +793,52 @@ def estimate_cost():
     move_date = data.get("move_date", "Unknown")
 
     if not (origin and destination and move_size):
-        return jsonify({"error": "Missing required fields (origin, destination, move_size)."}), 400
+        return jsonify(
+            {"error": "Missing required fields."}), 400
 
-    distance, cost_range_or_error = maps_manager.estimate_cost(origin, destination, move_size, additional_services)
-    if distance is None:
-        return jsonify({"error": cost_range_or_error}), 400
+    try:
+        distance, cost_range_or_error = maps_manager.estimate_cost(
+            origin, destination, move_size, additional_services
+        )
+        if distance is None:
+            return jsonify({"error": cost_range_or_error}), 400
 
-    min_cost, max_cost = cost_range_or_error
-    estimated_cost = f"${min_cost} - ${max_cost}"
+        min_cost, max_cost = cost_range_or_error
+        estimated_cost = f"${min_cost} - ${max_cost}"
 
-    move_details = {
-        "name": username,
-        "contact_no": contact_no,
-        "origin": origin,
-        "destination": destination,
-        "date": move_date,
-        "move_size": move_size,
-        "additional_services": additional_services
-    }
-    redis_manager.store_move_details(chat_id, move_details, estimated_cost)
+        # Create or update ChatSession
+        chat_session = ChatSession.query.filter_by(chat_id=chat_id).first()
+        if not chat_session:
+            chat_session = ChatSession(
+                chat_id=chat_id,
+                username=username,
+                contact_no=contact_no
+            )
+        chat_session.estimated_cost_min = min_cost
+        chat_session.estimated_cost_max = max_cost
+        chat_session.move_date = move_date
+        db.session.add(chat_session)
+        db.session.commit()
 
-    return jsonify({"estimated_cost": estimated_cost, "chat_id": chat_id})
+        # Create or update MoveDetail
+        move_detail = MoveDetail.query.filter_by(chat_id=chat_id).first()
+        if not move_detail:
+            move_detail = MoveDetail(chat_id=chat_id)
+        move_detail.origin = origin
+        move_detail.destination = destination
+        move_detail.move_size = move_size
+        move_detail.additional_services = ",".join(additional_services)
+        db.session.add(move_detail)
+        db.session.commit()
+
+        return jsonify(
+            {"estimated_cost": estimated_cost, "chat_id": chat_id}), 200
+    except Exception as e:
+        logger.error(f"Error estimating cost: {e}")
+        return jsonify({"error": f"An error occurred: {e}"}), 500
 
 ##############################################
 # RUN THE APP
 ##############################################
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)
