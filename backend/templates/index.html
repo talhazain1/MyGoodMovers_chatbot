@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MoveBot 🤖 - My Good Movers Chatbot</title>
+  <link rel="stylesheet" href="../static/style.css">
+</head>
+<body>
+  <!-- Floating Chat Icon -->
+  <img
+    src="https://cdn-icons-png.flaticon.com/512/8692/8692101.png"
+    alt="Chat Icon"
+    class="chat-icon"
+    onclick="toggleChatWindow()"
+  />
+
+  <!-- Chat Window -->
+  <div id="chatWindow" class="chat-window">
+    <div class="chat-header">
+      <span>MoveBot 🤖</span>
+      <button class="close-button" onclick="toggleChatWindow()">&times;</button>
+    </div>
+    <div id="chatBody" class="chat-body"></div>
+    
+    <!-- Confirmation Buttons Container -->
+    <div id="confirmationButtons" class="confirmation-buttons" style="display: none;">
+      <button id="confirmYes" class="yes-button">Yes 👍</button>
+      <button id="confirmNo" class="no-button">No 👎</button>
+    </div>
+
+    <div class="chat-footer">
+      <input 
+        type="text" 
+        id="userInput" 
+        class="chat-input" 
+        placeholder="Type your message..." 
+        autocomplete="off" 
+        disabled 
+      />
+      <button class="send-button" onclick="sendMessage()" disabled>Send</button>
+      <button class="end-button" onclick="endChat()" disabled>End</button>
+    </div>
+    <div id="loadingIndicator" class="loading" style="display: none;">
+      Initializing chat...
+    </div>
+    <div id="errorMessage" class="error-message" style="display: none;"></div>
+  </div>
+
+  <script>
+    // State variables
+    let chatOpen = false;
+    let currentChatId = null;
+    let isAwaitingConfirmation = false;
+    let isChatInitialized = false;
+    let isFirstLoad = true;
+    let isInitializing = false;
+
+    // Toggle chat window open/close
+    async function toggleChatWindow() {
+      const chatWindow = document.getElementById("chatWindow");
+      
+      // Toggle visibility
+      chatOpen = !chatOpen;
+      chatWindow.style.display = chatOpen ? "flex" : "none";
+      
+      console.log(`Chat window is now ${chatOpen ? 'open' : 'closed'}.`);
+      
+      // Only initialize on first open and not already initialized
+      if (chatOpen && !isChatInitialized && isFirstLoad && !isInitializing) {
+        isFirstLoad = false;
+        isInitializing = true;
+        
+        const chatBody = document.getElementById("chatBody");
+        const loadingIndicator = document.getElementById("loadingIndicator");
+        const errorMessage = document.getElementById("errorMessage");
+        const confirmationButtons = document.getElementById("confirmationButtons");
+        
+        // Clear previous messages and errors
+        chatBody.innerHTML = "";
+        errorMessage.style.display = "none";
+        errorMessage.textContent = "";
+        confirmationButtons.style.display = "none";
+        
+        // Show loading indicator
+        loadingIndicator.style.display = "block";
+        
+        try {
+          // Initialize chat session
+          await initializeChat();
+        } catch (error) {
+          console.error("Failed to initialize chat:", error);
+          displayError("Failed to initialize chat. Please try again.");
+        } finally {
+          // Hide loading indicator
+          loadingIndicator.style.display = "none";
+          isInitializing = false;
+        }
+      }
+    }
+
+    // Initialize chat by starting a new session
+    async function initializeChat() {
+      if (isChatInitialized) {
+        console.log("Chat already initialized, skipping...");
+        return;
+      }
+
+      try {
+        console.log("Initializing chat session...");
+        const response = await fetch("/start_chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}) // You can include username/contact_no if needed
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Server Error (${response.status}): ${errorText}`);
+        }
+
+        const data = await response.json();
+        console.log("Chat initialization response:", data);
+
+        if (data.chat_id) {
+          currentChatId = data.chat_id;
+          isChatInitialized = true;
+          console.log(`Chat session initialized with chat_id: ${currentChatId}`);
+
+          // Enable input and buttons
+          document.getElementById("userInput").disabled = false;
+          document.querySelector(".send-button").disabled = false;
+          document.querySelector(".end-button").disabled = false;
+
+          // Display the welcome message
+          if (data.message) {
+            addBotMessage(data.message + " 👋");
+          } else {
+            addBotMessage("Hello! I'm MoveBot 🤖. How can I assist you with your move today? 📦🚚");
+          }
+        } else {
+          throw new Error("No chat_id received from server.");
+        }
+      } catch (err) {
+        isChatInitialized = false; // Reset initialization flag on error
+        throw err; // Re-throw to be handled by caller
+      }
+    }
+
+    // Append user message to the chat body
+    function addUserMessage(msg) {
+      const div = document.createElement("div");
+      div.classList.add("message", "user");
+      div.textContent = msg;
+      document.getElementById("chatBody").appendChild(div);
+      scrollToBottom();
+      console.log(`User message added: ${msg}`);
+    }
+
+    // Append bot message to the chat body
+    function addBotMessage(msg) {
+      const div = document.createElement("div");
+      div.classList.add("message", "bot");
+      div.innerHTML = msg; // Use innerHTML to support HTML formatting
+      document.getElementById("chatBody").appendChild(div);
+      scrollToBottom();
+      console.log(`Bot message added: ${msg}`);
+
+      // Check if the bot message includes a confirmation prompt
+      if (msg.includes("Do you want to confirm your move?") || msg.includes("Do you confirm your details?")) {
+        displayConfirmationButtons();
+      }
+    }
+
+    // Display Yes/No confirmation buttons
+    function displayConfirmationButtons() {
+      isAwaitingConfirmation = true;
+      const confirmationButtons = document.getElementById("confirmationButtons");
+      confirmationButtons.style.display = "flex";
+    }
+
+    // Hide confirmation buttons
+    function hideConfirmationButtons() {
+      const confirmationButtons = document.getElementById("confirmationButtons");
+      confirmationButtons.style.display = "none";
+    }
+
+    // Auto-scroll to latest message
+    function scrollToBottom() {
+      const chatBody = document.getElementById("chatBody");
+      chatBody.scrollTop = chatBody.scrollHeight;
+    }
+
+    // Send a message to the server
+    async function sendMessage() {
+      if (!currentChatId) {
+        displayError("Error: Chat session not initialized.");
+        return;
+      }
+
+      const userInput = document.getElementById("userInput");
+      const text = userInput.value.trim();
+      if (!text) return;
+
+      // Display user message
+      addUserMessage(text);
+      userInput.value = "";
+
+      try {
+        // Send the message to the backend
+        const response = await fetch("/general_query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text, chat_id: currentChatId })
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Server Error (${response.status}): ${errorText}`);
+        }
+
+        const data = await response.json();
+        console.log("General query response:", data);
+
+        // Handle errors returned from the server
+        if (data.error) {
+          displayError(data.error);
+          return;
+        }
+
+        // Bot reply
+        if (data.reply) {
+          addBotMessage(data.reply);
+        } else {
+          addBotMessage("I didn't receive a valid response from the server.");
+        }
+      } catch (err) {
+        displayError("Error: Unable to send message.");
+        console.error("sendMessage() error:", err);
+      }
+    }
+
+    // End the current chat session
+    async function endChat() {
+      if (!currentChatId) {
+        addBotMessage("No active chat session to end.");
+        return;
+      }
+
+      try {
+        const response = await fetch("/end_chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: currentChatId })
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Server Error (${response.status}): ${errorText}`);
+        }
+
+        const data = await response.json();
+        addBotMessage(data.message || "Chat ended.");
+
+        // Reset state
+        document.getElementById("chatBody").innerHTML = "";
+        document.getElementById("userInput").disabled = true;
+        document.querySelector(".send-button").disabled = true;
+        document.querySelector(".end-button").disabled = true;
+        hideConfirmationButtons();
+        
+        currentChatId = null;
+        isChatInitialized = false;
+        isAwaitingConfirmation = false;
+        isFirstLoad = true;
+
+      } catch (err) {
+        displayError("Error: Unable to end chat.");
+        console.error("endChat() error:", err);
+      }
+    }
+
+    // Display error messages to the user
+    function displayError(message) {
+      const errorMessage = document.getElementById("errorMessage");
+      errorMessage.textContent = message;
+      errorMessage.style.display = "block";
+      scrollToBottom();
+    }
+
+    // Handle confirmation button clicks
+    async function handleConfirmation(response) {
+      if (!currentChatId) {
+        displayError("No active chat session.");
+        return;
+      }
+
+      // Disable buttons to prevent multiple clicks
+      document.getElementById("confirmYes").disabled = true;
+      document.getElementById("confirmNo").disabled = true;
+
+      try {
+        // Send the confirmation response as a regular message
+        const userResponse = response === 'yes' ? "Yes" : "No";
+        addUserMessage(userResponse);
+
+        // Hide the confirmation buttons
+        hideConfirmationButtons();
+
+        // Send the confirmation to the backend
+        const serverResponse = await fetch("/general_query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: userResponse, chat_id: currentChatId })
+        });
+
+        if (!serverResponse.ok) {
+          const errorText = await serverResponse.text();
+          throw new Error(`Server Error (${serverResponse.status}): ${errorText}`);
+        }
+
+        const data = await serverResponse.json();
+        console.log("Confirmation response from server:", data);
+
+        // Handle errors returned from the server
+        if (data.error) {
+          displayError(data.error);
+          return;
+        }
+
+        // Display the assistant's reply
+        if (data.reply) {
+          addBotMessage(data.reply);
+        } else {
+          addBotMessage("I didn't receive a valid response from the server.");
+        }
+
+      } catch (err) {
+        displayError("Error: Unable to process your confirmation.");
+        console.error("handleConfirmation() error:", err);
+      }
+    }
+
+    // Event Listeners for confirmation buttons
+    document.getElementById("confirmYes").addEventListener("click", () => {
+      handleConfirmation('yes');
+    });
+
+    document.getElementById("confirmNo").addEventListener("click", () => {
+      handleConfirmation('no');
+    });
+
+    // Event Listeners for send and enter key
+    document.querySelector(".send-button").addEventListener("click", () => {
+      if (!isAwaitingConfirmation) {
+        const message = document.getElementById("userInput").value.trim();
+        if (message) {
+          sendMessage();
+        }
+      }
+    });
+
+    document.getElementById("userInput").addEventListener("keypress", (e) => {
+      if (e.key === "Enter" && !isAwaitingConfirmation) {
+        e.preventDefault();
+        const message = document.getElementById("userInput").value.trim();
+        if (message) {
+          sendMessage();
+        }
+      }
+    });
+
+    // Initialize on page load
+    window.onload = () => {
+      // Reset all state variables on page load
+      chatOpen = false;
+      currentChatId = null;
+      isChatInitialized = false;
+      isAwaitingConfirmation = false;
+      isFirstLoad = true;
+      isInitializing = false;
+      
+      const chatWindow = document.getElementById("chatWindow");
+      chatWindow.style.display = "none";
+    };
+  </script>
+</body>
+</html>
