@@ -9,13 +9,13 @@ class MapsManager:
         self.client = googlemaps.Client(key=os.getenv("GOOGLE_MAPS_API_KEY"))
         self.base_rate_per_mile = 1.50
         self.move_size_rates = {
-            "studio": 0.50 * 400,
-            "1-bedroom": 0.50 * 800,
-            "2-bedroom": 0.50 * 1200,
-            "3-bedroom": 0.50 * 1600,
-            "4-bedroom": 0.50 * 2000,
-            "office": 0.50 * 2500,
-            "car": 0.50 * 150
+            "studio": 0.80 * 400,
+            "1-bedroom": 0.80 * 800,
+            "2-bedroom": 0.80 * 1200,
+            "3-bedroom": 0.80 * 1600,
+            "4-bedroom": 0.80 * 2000,
+            "office": 0.80 * 2500,
+            "car": 0.80 * 150
         }
         self.additional_charges = {
             "packing": 150,
@@ -47,7 +47,7 @@ class MapsManager:
         additional_cost = sum(self.additional_charges.get(service, 0) for service in (additional_services or []))
         total_cost = base_cost + move_size_cost + additional_cost
 
-        min_cost = total_cost * 0.9
-        max_cost = total_cost * 1.1
+        min_cost = total_cost * 1.2
+        max_cost = total_cost * 1.7
 
         return distance, (round(min_cost, 2), round(max_cost, 2))
