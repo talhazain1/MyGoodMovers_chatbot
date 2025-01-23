@@ -13,10 +13,10 @@ from dateutil import parser
 import logging
 
 # Managers (Ensure these are correctly implemented in separate modules)
-from .openai_manager import OpenAIManager
-from .maps_manager import MapsManager
-from .faq_manager import FAQManager
-from .config import Config
+from openai_manager import OpenAIManager
+from maps_manager import MapsManager
+from faq_manager import FAQManager
+from config import Config
 
 ##############################################
 # FLASK APP SETUP + CORS + SQLALCHEMY CONFIG
