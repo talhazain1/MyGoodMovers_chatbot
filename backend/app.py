@@ -13,9 +13,9 @@ from dateutil import parser
 import logging
 
 # Managers (Ensure these are correctly implemented in separate modules)
-from openai_manager import OpenAIManager
-from maps_manager import MapsManager
-from faq_manager import FAQManager
+from .openai_manager import OpenAIManager
+from .maps_manager import MapsManager
+from .faq_manager import FAQManager
 
 ##############################################
 # FLASK APP SETUP + CORS + SQLALCHEMY CONFIG
@@ -122,7 +122,7 @@ openai_manager = OpenAIManager()
 maps_manager = MapsManager()
 faq_manager = FAQManager()
 # Adjust the path to your FAQ dataset
-faq_manager.load_faqs("/Users/TalhaZain/chatbot_html/backend/data/faqs.jsonl")
+faq_manager.load_faqs("/backend/data/faqs.jsonl")
 
 ##############################################
 # LOGGER CONFIGURATION
