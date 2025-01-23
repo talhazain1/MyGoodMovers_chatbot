@@ -16,6 +16,7 @@ import logging
 from .openai_manager import OpenAIManager
 from .maps_manager import MapsManager
 from .faq_manager import FAQManager
+from config import Config
 
 ##############################################
 # FLASK APP SETUP + CORS + SQLALCHEMY CONFIG
